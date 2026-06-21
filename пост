@@ -1,0 +1,405 @@
+import asyncio
+import logging
+from collections import defaultdict
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ChatMemberHandler,
+    ContextTypes,
+    filters,
+    PicklePersistence,
+)
+
+# ─── Настройки ────────────────────────────────────────────────────────────────
+BOT_TOKEN = "8818186952:AAHOF4l0vu-FsSnjsyCpj6zfiZIt62KZ6sU"
+POST_INTERVAL_SECONDS = 6 * 60 * 60   # ✅ 6 часов между публикациями
+PERSISTENCE_FILE = "bot_persistence.pkl"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── Каналы с FULL VIDEO ──────────────────────────────────────────────────────
+# Добавь сюда ID каналов и ссылки, где нужна подпись FULL VIDEO.
+# ID канала можно узнать через @userinfobot или из логов бота.
+# Формат: ID_канала (число): "ссылка"
+#
+# Пример:
+# FULL_VIDEO_CHANNELS = {
+#     -1001234567890: "https://t.me/your_channel_1",
+#     -1009876543210: "https://t.me/your_channel_2",
+#     -1001111111111: "https://example.com/video",
+#     -1002222222222: "https://example.com/video",
+# }
+
+FULL_VIDEO_CHANNELS: dict[int, str] = {
+    -1004359871304: "https://t.me/drsthfghrtyhdzthztyutjztsyeahdgz",
+    -1004486397721: "https://t.me/drsthfghrtyhdzthztyutjztsyeahdgz",
+    -1004345243415: "https://t.me/drsthfghrtyhdzthztyutjztsyeahdgz",
+    -1003267678120: "https://t.me/drsthfghrtyhdzthztyutjztsyeahdgz",
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+user_state: dict = {}
+posting_tasks: dict = {}
+pending_media: dict = defaultdict(list)
+
+
+# ─── Вспомогательные функции ──────────────────────────────────────────────────
+
+
+def build_caption(original_caption: str, channel_id: int) -> tuple[str | None, str | None]:
+    """
+    Возвращает (caption, parse_mode) для поста.
+    Если канал в FULL_VIDEO_CHANNELS — добавляет кликабельную надпись FULL VIDEO.
+    Иначе — возвращает оригинальный caption без изменений.
+    """
+    if channel_id in FULL_VIDEO_CHANNELS:
+        url = FULL_VIDEO_CHANNELS[channel_id]
+        full_video_link = f'<a href="{url}">FULL VIDEO</a>'
+        if original_caption:
+            caption = f"{original_caption}\n\n{full_video_link}"
+        else:
+            caption = full_video_link
+        return caption, "HTML"
+    else:
+        return (original_caption or None), None
+
+
+async def get_admin_channels_from_context(bot, context, _user_id: int) -> list[dict]:
+    """Возвращает каналы, где бот является администратором."""
+    channels = []
+    known = context.application.bot_data.get("known_channels", {})
+
+    known_int = {int(k): v for k, v in known.items()}
+    context.application.bot_data["known_channels"] = known_int
+
+    for chat_id, title in list(known_int.items()):
+        try:
+            member = await bot.get_chat_member(chat_id, bot.id)
+            if member.status in ("administrator", "creator"):
+                channels.append({"id": chat_id, "title": title})
+        except TelegramError as e:
+            logger.warning(f"Не удалось проверить канал {chat_id} ({title}): {e}")
+            channels.append({"id": chat_id, "title": title})
+
+    return channels
+
+
+def main_menu_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"channel:{ch['id']}")]
+        for ch in channels
+    ]
+    buttons.append(
+        [InlineKeyboardButton("🔄 Обновить список каналов", callback_data="refresh")]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def channel_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Начать публикацию", callback_data="start_posting")],
+            [InlineKeyboardButton("🗑 Очистить медиа", callback_data="clear_videos")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back")],
+        ]
+    )
+
+
+# ─── Хендлеры ────────────────────────────────────────────────────────────────
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+    user_id: int = update.effective_user.id
+    user_state.pop(user_id, None)
+    pending_media.pop(user_id, None)
+
+    channels = await get_admin_channels_from_context(context.bot, context, user_id)
+
+    if not channels:
+        if update.message:
+            await update.message.reply_text(
+                "👋 Привет! Я пока не вижу каналов, где являюсь администратором.\n\n"
+                "1️⃣ Добавь меня как администратора в нужный канал.\n"
+                "2️⃣ Нажми /start ещё раз — список обновится."
+            )
+        return
+
+    if update.message:
+        await update.message.reply_text(
+            "👋 Привет! Выбери канал для публикации медиа:",
+            reply_markup=main_menu_keyboard(channels),
+        )
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✅ Единственное место, где канал добавляется или удаляется из списка."""
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    if not update.my_chat_member:
+        return
+
+    new_status = update.my_chat_member.new_chat_member.status
+    known: dict = context.application.bot_data.setdefault("known_channels", {})
+
+    if new_status in ("administrator", "creator"):
+        known[chat.id] = chat.title or str(chat.id)
+        logger.info(f"✅ Бот стал администратором: {chat.title} ({chat.id})")
+    elif new_status in ("left", "kicked"):
+        known.pop(chat.id, None)
+        logger.info(f"❌ Бот удалён из: {chat.title} ({chat.id})")
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+    if not data:
+        return
+
+    if data == "refresh":
+        channels = await get_admin_channels_from_context(context.bot, context, user_id)
+        if not channels:
+            await query.edit_message_text(
+                "Каналов не найдено. Добавь бота как администратора и нажми /start."
+            )
+        else:
+            await query.edit_message_text(
+                "Выбери канал:", reply_markup=main_menu_keyboard(channels)
+            )
+        return
+
+    if data == "back":
+        user_state.pop(user_id, None)
+        pending_media.pop(user_id, None)
+        channels = await get_admin_channels_from_context(context.bot, context, user_id)
+        await query.edit_message_text(
+            "Выбери канал:", reply_markup=main_menu_keyboard(channels)
+        )
+        return
+
+    if data.startswith("channel:"):
+        channel_id = int(data.split(":")[1])
+        known = context.application.bot_data.get("known_channels", {})
+        title = known.get(channel_id, str(channel_id))
+        user_state[user_id] = {"channel_id": channel_id, "channel_title": title}
+        pending_media[user_id] = []
+
+        # Показываем пометку если канал с FULL VIDEO
+        full_video_note = ""
+        if channel_id in FULL_VIDEO_CHANNELS:
+            full_video_note = "\n\n🔗 Под каждым постом будет добавлена подпись <b>FULL VIDEO</b> со ссылкой."
+
+        await query.edit_message_text(
+            f"📢 Канал: <b>{title}</b>\n\n"
+            "Пришли видео или фото (можно несколько) с подписью (caption).\n"
+            "Когда загрузишь все файлы — нажми <b>Начать публикацию</b>.\n"
+            f"Медиа будут отправляться по одному каждые <b>6 часов</b>.{full_video_note}",
+            parse_mode="HTML",
+            reply_markup=channel_menu_keyboard(),
+        )
+        return
+
+    if data == "clear_videos":
+        pending_media[user_id] = []
+        state = user_state.get(user_id, {})
+        title = state.get("channel_title", "")
+        await query.edit_message_text(
+            f"📢 Канал: <b>{title}</b>\n\nСписок медиа очищен. Отправь новые файлы.",
+            parse_mode="HTML",
+            reply_markup=channel_menu_keyboard(),
+        )
+        return
+
+    if data == "start_posting":
+        state = user_state.get(user_id)
+        media = pending_media.get(user_id, [])
+
+        if not state:
+            await query.edit_message_text("Сначала выбери канал через /start.")
+            return
+
+        if not media:
+            await query.answer(
+                "Сначала отправь хотя бы одно фото или видео!", show_alert=True
+            )
+            return
+
+        if user_id in posting_tasks and not posting_tasks[user_id].done():
+            posting_tasks[user_id].cancel()
+
+        channel_id = int(state["channel_id"])
+        channel_title = str(state["channel_title"])
+        media_copy = list(media)
+        pending_media.pop(user_id, None)
+
+        task = asyncio.create_task(
+            post_media_task(context.bot, user_id, channel_id, channel_title, media_copy)
+        )
+        posting_tasks[user_id] = task
+
+        await query.edit_message_text(
+            f"✅ Запущено! Буду публиковать <b>{len(media_copy)}</b> файлов в канал "
+            f"<b>{channel_title}</b>.\n"
+            "Можешь выбрать другой канал через /start.",
+            parse_mode="HTML",
+        )
+        return
+
+
+async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимаем видео или фото от пользователя и сохраняем в очередь."""
+    if not update.effective_user or not update.message:
+        return
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+
+    if not state:
+        await update.message.reply_text("Сначала выбери канал — нажми /start.")
+        return
+
+    msg = update.message
+    caption = msg.caption or ""
+    media_item = None
+
+    if msg.video:
+        media_item = {"type": "video", "file_id": msg.video.file_id, "caption": caption}
+    elif msg.document and msg.document.mime_type and "video" in msg.document.mime_type:
+        media_item = {"type": "video", "file_id": msg.document.file_id, "caption": caption}
+    elif msg.photo:
+        best_photo = max(msg.photo, key=lambda p: p.file_size or 0)
+        media_item = {"type": "photo", "file_id": best_photo.file_id, "caption": caption}
+
+    if not media_item:
+        await update.message.reply_text("Пожалуйста, отправь видео или фото.")
+        return
+
+    pending_media[user_id].append(media_item)
+    count = len(pending_media[user_id])
+    media_type_label = "📷 Фото" if media_item["type"] == "photo" else "🎬 Видео"
+
+    await update.message.reply_text(
+        f"✅ {media_type_label} #{count} добавлено в очередь.\n"
+        "Когда загрузишь все — нажми <b>Начать публикацию</b> в предыдущем сообщении.",
+        parse_mode="HTML",
+    )
+
+
+# ─── Задача публикации ────────────────────────────────────────────────────────
+
+
+async def post_media_task(
+    bot, user_id: int, channel_id: int, channel_title: str, media: list
+):
+    """Публикует медиа по одному с интервалом POST_INTERVAL_SECONDS (6 часов)."""
+    total = len(media)
+    for i, item in enumerate(media, start=1):
+        try:
+            # Формируем caption: с FULL VIDEO или без — зависит от канала
+            caption, parse_mode = build_caption(item["caption"], channel_id)
+
+            if item["type"] == "video":
+                await bot.send_video(
+                    chat_id=channel_id,
+                    video=item["file_id"],
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+            elif item["type"] == "photo":
+                await bot.send_photo(
+                    chat_id=channel_id,
+                    photo=item["file_id"],
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+
+            logger.info(f"Опубликовано {item['type']} {i}/{total} в {channel_title}")
+
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"📤 {'Фото' if item['type'] == 'photo' else 'Видео'} {i}/{total} "
+                    f"опубликовано в <b>{channel_title}</b>.",
+                    parse_mode="HTML",
+                )
+            except TelegramError:
+                pass
+
+            if i < total:
+                await asyncio.sleep(POST_INTERVAL_SECONDS)
+
+        except asyncio.CancelledError:
+            logger.info(f"Задача публикации отменена для user {user_id}")
+            return
+        except TelegramError as e:
+            logger.error(f"Ошибка публикации: {e}")
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"❌ Ошибка при публикации файла {i}/{total}: {e}",
+                )
+            except TelegramError:
+                pass
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 Все {total} файлов опубликованы в <b>{channel_title}</b>!",
+            parse_mode="HTML",
+        )
+    except TelegramError:
+        pass
+
+
+# ─── Запуск ───────────────────────────────────────────────────────────────────
+
+
+def main():
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(
+        MessageHandler(
+            filters.VIDEO | filters.PHOTO | filters.Document.VIDEO,
+            receive_media,
+        )
+    )
+    app.add_handler(
+        ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+
+    logger.info("Бот запущен...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
