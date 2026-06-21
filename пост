@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8818186952:AAHOF4l0vu-FsSnjsyCpj6zfiZIt62KZ6sU"
+BOT_TOKEN = "8650634930:AAHJlWHy2KrQFNO1r6lwG4veyOqXJqEKoOg"
 POST_INTERVAL_SECONDS = 6 * 60 * 60   # ✅ 6 часов между публикациями
 PERSISTENCE_FILE = "bot_persistence.pkl"
 # ──────────────────────────────────────────────────────────────────────────────
